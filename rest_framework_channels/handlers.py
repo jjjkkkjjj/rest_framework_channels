@@ -174,11 +174,6 @@ class AsyncActionHandler(metaclass=APIActionHandlerMetaclass):
 
         return self
 
-    def __del__(self):
-        group_id = self.kwargs.get(self.group_send_lookup_kwargs)
-        if group_id is not None:
-            self.channel_layer.group_discard(group_id, self.channel_name)
-
     @property
     def group_id(self):
         if self.group_send_lookup_kwargs:
@@ -208,6 +203,9 @@ class AsyncActionHandler(metaclass=APIActionHandlerMetaclass):
         if reason:
             message['reason'] = reason
         await self.base_send(message)
+        group_id = self.kwargs.get(self.group_send_lookup_kwargs)
+        if group_id is not None:
+            await self.channel_layer.group_discard(group_id, self.channel_name)
 
     async def send_json(self, content, close=False):
         """
