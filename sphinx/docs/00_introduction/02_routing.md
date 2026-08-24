@@ -70,6 +70,7 @@ Second, you should pass the `as_aaah()` instead of `as_asgi()` or `as_view()` in
 `as_aaah()` is class method. `aaah` is abbreviation for **A**sync **A**PI **A**ction **H**andler (not scream 😛).  Because this has similar interface with channels `asgi` and django's `view`, you can use the original `path` and `re_path` function in `django.urls`.
 
 ```{note}
-We do not support the `include` function. Shortly, you can't define the nested routings.
-To do this, the separated `ActionHandler` is the workaround.
+We do not support the `include` function. Declare `routepatterns` on each
+`ActionHandler` instead; nesting composes, because each level resolves against
+the part of the route its parent has not consumed.
 ```

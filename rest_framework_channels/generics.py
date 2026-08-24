@@ -19,6 +19,10 @@ from .settings import api_settings
 from .utils import request_from_scope
 
 
+
+#: Sentinel meaning "fall back to api_settings", distinct from an explicit None.
+_UNSET = object()
+
 class GenericAsyncAPIActionHandler(AsyncAPIActionHandler):
     """
     Base class for all other generic action handlers.
@@ -42,7 +46,10 @@ class GenericAsyncAPIActionHandler(AsyncAPIActionHandler):
     filter_backends = api_settings.DEFAULT_FILTER_BACKENDS
 
     # The style to use for queryset pagination.
-    pagination_class = api_settings.DEFAULT_PAGINATION_CLASS
+    # _UNSET (not None) is the "use the setting" sentinel, because an explicit
+    # None already means "pagination disabled". Resolving in the class body
+    # would freeze the setting at import time.
+    pagination_class = _UNSET
 
     # Allow generic typing checking for generic views.
     def __class_getitem__(cls, *args, **kwargs):
@@ -158,10 +165,13 @@ class GenericAsyncAPIActionHandler(AsyncAPIActionHandler):
         The paginator instance associated with the view, or `None`.
         """
         if not hasattr(self, '_paginator'):
-            if self.pagination_class is None:
+            pagination_class = self.pagination_class
+            if pagination_class is _UNSET:
+                pagination_class = api_settings.DEFAULT_PAGINATION_CLASS
+            if pagination_class is None:
                 self._paginator = None
             else:
-                self._paginator = self.pagination_class()
+                self._paginator = pagination_class()
         return self._paginator
 
     def paginate_queryset(self, queryset: QuerySet) -> QuerySet:

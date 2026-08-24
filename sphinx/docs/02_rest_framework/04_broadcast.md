@@ -37,6 +37,11 @@ The available arguments about broadcast are here;
     - `'broadcast'`: Broadcast the response to the users in the specific group
     - `'none'`: Do nothing at all
 - `broadcast_type` : str
-  - The type for broadcasting. If you specify this variable, use `'_general.broadcast'`
+  - The message type used for broadcasting, defaulting to `'general.broadcast'`
+    (handled by `AsyncAPIConsumerBase.general_broadcast`).
+  - The type maps to a handler name by replacing `.` with `_`, and channels
+    rejects any name starting with an underscore. So `'_general.broadcast'` and
+    any other leading-underscore type cannot be delivered -- the resulting error
+    is raised inside the recipient's receive loop and drops its connection.
 - `send_response_in_broadcast` : bool
   - Whether to send the response in broadcast mode, default to True

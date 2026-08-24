@@ -63,6 +63,11 @@ class APIActionHandlerMetaclass(type):
 
         for route in getattr(cls, 'routepatterns', []):
 
+            if not route.callback and isinstance(route, URLResolver):
+                raise ImproperlyConfigured(f'{route}: include() is not supported.')
+
+            assert isinstance(route, URLPattern)
+
             pattern = route.pattern
             if isinstance(pattern, RegexPattern):
                 arg = pattern._regex
@@ -70,30 +75,25 @@ class APIActionHandlerMetaclass(type):
                 arg = pattern._route
             else:
                 raise ValueError(f'Unsupported pattern type: {type(pattern)}')
-            route.pattern = pattern.__class__(arg, pattern.name, is_endpoint=False)
 
-            if not route.callback and isinstance(route, URLResolver):
-                raise ImproperlyConfigured(f'{route}: include() is not supported.')
+            # Build a *copy* rather than mutating the URLPattern in place.
+            # `path()`/`re_path()` objects are frequently shared -- with a real
+            # Django urlpatterns list, or with a base class whose routepatterns
+            # this subclass inherited. Rewriting them here would silently turn
+            # those routes into prefix matches for everyone else too.
+            copied = URLPattern(
+                pattern.__class__(arg, pattern.name, is_endpoint=False),
+                route.callback,
+                route.default_args,
+                route.name,
+            )
 
-            assert isinstance(route, URLPattern)
-            if cls.group_send_lookup_kwargs is not None:
-                route.callback.handler_class._parent_group_send_lookup_kwargs = (
-                    cls.group_send_lookup_kwargs
-                )
-            cls.routing.append(route)
-
-        exception_handler = api_settings.EXCEPTION_HANDLER
-        # to async
-        if not asyncio.iscoroutinefunction(exception_handler):
-            from functools import wraps
-
-            @wraps(exception_handler)
-            async def async_exception_handler(*args, **kwargs):
-                return await database_sync_to_async(exception_handler)(*args, **kwargs)
-
-            exception_handler = async_exception_handler
-
-        cls.exception_handler = exception_handler
+            # The parent's lookup name travels with the route entry and is
+            # handed to the child through the scope. Writing it onto the child
+            # *class* would be a process-global mutation: mounting the same
+            # handler under two parents would leave whichever class body was
+            # executed last in charge of both.
+            cls.routing.append(copied, cls.group_send_lookup_kwargs)
 
         return cls
 
@@ -110,10 +110,11 @@ class AsyncActionHandler(metaclass=APIActionHandlerMetaclass):
     available_actions: dict[str, str]
     actions_kwargs: dict[str, dict[str, Any]]
 
-    # callable
-    # Caution: Use this function as staticmethod!
-    # such like AsyncActionHandler.exception_handler
-    exception_handler: Callable
+    # Set this on a subclass to override the handler for that class only.
+    # None means "resolve api_settings.EXCEPTION_HANDLER when an exception
+    # occurs", so override_settings and the setting_changed reload both work.
+    # Assign a plain function (or a staticmethod); it is never bound to self.
+    exception_handler: Optional[Callable] = None
 
     _sync = False
 
@@ -121,7 +122,10 @@ class AsyncActionHandler(metaclass=APIActionHandlerMetaclass):
     routing: RoutingManager
     routepatterns = []
 
-    json_encoder_class: json.JSONEncoder = api_settings.JSON_ENCODER_CLASS
+    # None means "ask api_settings when needed". Binding the setting in the
+    # class body freezes it at import time, so `override_settings` (and the
+    # setting_changed reload) can never take effect.
+    json_encoder_class: Optional[json.JSONEncoder] = None
 
     channel_layer_alias = DEFAULT_CHANNEL_LAYER
     group_send_lookup_kwargs = None
@@ -136,11 +140,13 @@ class AsyncActionHandler(metaclass=APIActionHandlerMetaclass):
         self.channel_layer: BaseChannelLayer = get_channel_layer(
             self.channel_layer_alias
         )
-        if self.channel_layer is not None:
-            self.channel_name = await self.channel_layer.new_channel()
-            self.channel_receive = partial(
-                self.channel_layer.receive, self.channel_name
-            )
+        # No new_channel() here on purpose. `__call__` runs once per inbound
+        # message, and an action handler never reads from its own channel -- it
+        # returns instead of entering a receive loop -- so minting a name every
+        # message was pure round-trip overhead. Consumers get their channel from
+        # Channels' own AsyncConsumer.__call__, once per connection.
+        self.channel_name = None
+        self.channel_receive = None
 
         self.action = None
         self.scope = scope
@@ -158,19 +164,18 @@ class AsyncActionHandler(metaclass=APIActionHandlerMetaclass):
             if 'kwargs' in scope['url_route']:
                 self.kwargs = scope['url_route']['kwargs']
 
-        if self.channel_layer is not None and self.group_send_lookup_kwargs is not None:
-            # add group
-            assert self.group_send_lookup_kwargs in self.kwargs, (
-                f'Expected {self.__class__.__name__} to be called with '
-                f'a URL keyword argument named "{self.group_send_lookup_kwargs}". '
-                'Fix your routepettern, or set the `.group_send_lookup_kwargs` '
-                f'attribute on the {self.__class__.__name__} correctly.'
-            )
-            group_id = self.kwargs.get(self.group_send_lookup_kwargs)
-            if group_id is not None:
-                self.channel_layer.group_add(group_id, self.channel_name)
-            else:
-                raise AssertionError('The group_send_lookup_kwargs of kwargs is None')
+        # NOTE: An action handler deliberately does NOT join the channel group.
+        #
+        # `__call__` runs once per *inbound message* (`as_aaah` builds a fresh
+        # instance every time) and mints a fresh `channel_name` on each run, so
+        # joining here would add one dead channel to the group per message with
+        # nothing to discard them. It would also be pointless: this class
+        # returns below instead of entering a receive loop, so `channel_receive`
+        # is never consumed and a joined channel could never be read.
+        #
+        # Group membership belongs to the consumer -- see
+        # `AsyncAPIConsumerBase.__call__`, whose `groups` entry Channels joins
+        # (and discards on disconnect) for the lifetime of the connection.
 
         return self
 
@@ -178,7 +183,14 @@ class AsyncActionHandler(metaclass=APIActionHandlerMetaclass):
     def group_id(self):
         if self.group_send_lookup_kwargs:
             return self.kwargs.get(self.group_send_lookup_kwargs)
-        return self.kwargs.get(self._parent_group_send_lookup_kwargs)
+        # The routing entry passes the parent's lookup name through the scope so
+        # that the same handler class can be mounted under several parents.
+        parent_lookup = self.scope.get(
+            'parent_group_send_lookup_kwargs'
+        ) or self._parent_group_send_lookup_kwargs
+        if parent_lookup is None:
+            return None
+        return self.kwargs.get(parent_lookup)
 
     async def send(self, text_data=None, bytes_data=None, close=False):
         """
@@ -203,8 +215,15 @@ class AsyncActionHandler(metaclass=APIActionHandlerMetaclass):
         if reason:
             message['reason'] = reason
         await self.base_send(message)
-        group_id = self.kwargs.get(self.group_send_lookup_kwargs)
-        if group_id is not None:
+        # Use the property, not `self.group_send_lookup_kwargs` directly: on a
+        # child handler that attribute is None, making the lookup `kwargs[None]`
+        # and the discard a permanent no-op.
+        group_id = self.group_id
+        if (
+            group_id is not None
+            and self.channel_layer is not None
+            and self.channel_name is not None
+        ):
             await self.channel_layer.group_discard(group_id, self.channel_name)
 
     async def send_json(self, content, close=False):
@@ -219,7 +238,10 @@ class AsyncActionHandler(metaclass=APIActionHandlerMetaclass):
 
     @classmethod
     async def encode_json(cls, content) -> str:
-        return json.dumps(content, cls=AsyncActionHandler.json_encoder_class)
+        encoder_class = (
+            cls.json_encoder_class or api_settings.JSON_ENCODER_CLASS
+        )
+        return json.dumps(content, cls=encoder_class)
 
     @classmethod
     def as_aaah(cls, **initkwargs) -> Self:
@@ -244,14 +266,22 @@ class AsyncActionHandler(metaclass=APIActionHandlerMetaclass):
 
 
 class AsyncAPIActionHandler(AsyncActionHandler):
-    permission_classes = api_settings.DEFAULT_PERMISSION_CLASSES
+    # None means "ask api_settings when needed" -- see json_encoder_class above.
+    #
+    # NOTE: these defaults come from the REST_FRAMEWORK_CHANNELS setting, NOT
+    # from DRF's REST_FRAMEWORK. Hardening DRF's DEFAULT_PERMISSION_CLASSES has
+    # no effect on websocket handlers; the default here is AllowAny.
+    permission_classes: Optional[list] = None
 
     async def get_permissions(self, **kwargs) -> list[BasePermission]:
         """
         Instantiates and returns the list of permissions that this view requires.
         """
+        permission_classes = self.permission_classes
+        if permission_classes is None:
+            permission_classes = api_settings.DEFAULT_PERMISSION_CLASSES
         permission_instances = []
-        for permission_class in self.permission_classes:
+        for permission_class in permission_classes:
             instance = permission_class()
 
             # If the permission is an DRF permission instance
@@ -301,7 +331,7 @@ class AsyncAPIActionHandler(AsyncActionHandler):
         ):
             context.update(status=exc.status_code, errors=[exc.detail])
         else:
-            context = await AsyncActionHandler.exception_handler(exc, context)
+            context = await self.get_exception_handler()(exc, context)
         if context:
             await self.reply(**context)
         else:
@@ -310,6 +340,20 @@ class AsyncAPIActionHandler(AsyncActionHandler):
                 exc_info=exc,
             )
             raise exc
+
+    def get_exception_handler(self) -> Callable:
+        """Return the exception handler as an awaitable callable.
+
+        Resolved per call rather than at import time so that
+        ``override_settings(REST_FRAMEWORK_CHANNELS=...)`` takes effect, and so
+        that a subclass can set ``exception_handler`` for itself alone.
+        """
+        handler = type(self).exception_handler
+        if handler is None:
+            handler = api_settings.EXCEPTION_HANDLER
+        if not asyncio.iscoroutinefunction(handler):
+            return database_sync_to_async(handler)
+        return handler
 
     async def handle_action(self, action: str, route: Optional[str], **kwargs):
         """
@@ -329,10 +373,18 @@ class AsyncAPIActionHandler(AsyncActionHandler):
                 handler: AsyncActionHandler = await self.routing.resolve(
                     route, self.scope, self.base_receive, self.base_send
                 )
+                # Hand the child the *remaining* path, not the whole route, so
+                # that nesting composes. Passing `route` unchanged only worked
+                # because a leaf's routing is empty; a third level could never
+                # match, and a self-referential routing recursed forever.
+                # The original route still reaches the client via scope['route'].
                 # response is None
-                await handler.handle_action(action, route, **kwargs)
+                await handler.handle_action(
+                    action, handler.scope.get('path_remaining', route), **kwargs
+                )
             except RouteMissingException:
-                # the action will be processed this class
+                # Normal control flow, not a failure: no child route matched, so
+                # this class handles the action itself.
 
                 if action not in self.available_actions:
                     raise ActionNotAllowed(action=action) from None
@@ -342,37 +394,58 @@ class AsyncAPIActionHandler(AsyncActionHandler):
                 mode = method_kwargs.get('mode', 'response')
                 method = getattr(self, method_name)
 
-                reply = partial(self.reply, action=action)
+                # Echo the route the client actually sent. `route` here may be
+                # the remaining path handed down by a parent, which the client
+                # would not recognise.
+                reply = partial(
+                    self.reply,
+                    action=action,
+                    route=self.scope.get('route', route),
+                )
 
                 # the @action decorator will wrap non-async action into async ones.
                 # append query params to path_reamining if it exists
+                #
+                # Read from the scope this instance was called with, never from
+                # a `path_remaining` we ourselves wrote for an earlier message.
+                # A consumer's scope lives for the whole connection, so folding
+                # our own writes back in leaked query params across messages.
+                base_scope = getattr(self, '_base_scope', None)
+                if base_scope is None:
+                    base_scope = self._base_scope = self.scope
+
                 query_dict = {}
                 if route:
                     query_dict.update(parse_qs(urlparse(route).query))
 
-                path_remaining = self.scope.get('path_remaining')
+                path_remaining = base_scope.get('path_remaining')
                 if path_remaining:
                     query_dict.update(parse_qs(urlparse(path_remaining).query))
 
                 query = urlencode(query_dict, doseq=True)
-                if query:
-                    self.scope.update(dict(path_remaining=query))
+                self.scope = (
+                    dict(base_scope, path_remaining=query) if query else base_scope
+                )
 
                 response = await method(action=action, **kwargs)
 
                 if isinstance(response, tuple):
                     data, status = response
                     if mode == 'response':
-                        await reply(data=data, status=status, route=route)
+                        await reply(data=data, status=status)
                     elif mode == 'broadcast':
+                        # Channels rejects any message type whose handler name
+                        # would start with an underscore, so the old default
+                        # ('_gereral.broadcast' -- also a typo) could never be
+                        # dispatched and killed every connection in the group.
                         broadcast_type = method_kwargs.get(
-                            'broadcast_type', '_gereral.broadcast'
+                            'broadcast_type', 'general.broadcast'
                         )
                         send_response_in_broadcast = method_kwargs.get(
                             'send_response_in_broadcast', True
                         )
                         if send_response_in_broadcast:
-                            await reply(data=data, status=status, route=route)
+                            await reply(data=data, status=status)
 
                         await self.channel_layer.group_send(
                             self.group_id,
@@ -382,11 +455,15 @@ class AsyncAPIActionHandler(AsyncActionHandler):
                         pass
 
         except Exception as exc:
-            await self.handle_exception(exc, action=action, route=route)
+            await self.handle_exception(
+                exc, action=action, route=self.scope.get('route', route)
+            )
 
     async def receive_json(self, content: dict, **kwargs):
         if 'action' not in content:
-            await self.handle_exception(ActionMissingException(), action=None)
+            await self.handle_exception(
+                ActionMissingException(), action=None, route=''
+            )
             return
         action = content.pop('action')
         # None means apply action in this consumer

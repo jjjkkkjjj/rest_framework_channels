@@ -62,9 +62,11 @@ async def production_exception_handlers(
     Any unhandled exceptions may return `None`, which will cause a 500 error
     to be raised.
     """
-    if isinstance(exc, ActionNotAllowed):
-        exc = exceptions.NotFound(*(exc.args))
-    elif isinstance(exc, exceptions.PermissionDenied):
+    # NOTE: ActionNotAllowed is intentionally not remapped here. It never
+    # reaches this function -- handle_exception short-circuits it -- and the old
+    # mapping downgraded 405 to 404 while dropping the detail, because
+    # ActionNotAllowed.__init__ never populates `args`.
+    if isinstance(exc, exceptions.PermissionDenied):
         exc = exceptions.PermissionDenied(*(exc.args))
 
     if isinstance(exc, exceptions.APIException):

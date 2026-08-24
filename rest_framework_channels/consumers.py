@@ -44,7 +44,10 @@ class AsyncAPIConsumerBase(AsyncJsonWebsocketConsumer, AsyncAPIActionHandler):
             )
             group_id = self.kwargs.get(self.group_send_lookup_kwargs)
             if group_id is not None:
-                self.groups += [group_id]
+                # Rebind rather than `+=`: if a subclass declares a class-level
+                # `groups` list, in-place concatenation mutates that shared list
+                # and every later connection joins all previously seen groups.
+                self.groups = list(self.groups or []) + [group_id]
             else:
                 raise AssertionError('The group_send_lookup_kwargs of kwargs is None')
 
@@ -59,7 +62,7 @@ class AsyncAPIConsumerBase(AsyncJsonWebsocketConsumer, AsyncAPIActionHandler):
         # instead of AsyncJsonWebsocketConsumer
         return await AsyncAPIActionHandler.receive_json(self, content, **kwargs)
 
-    async def _general_broadcast(self, event: dict):
+    async def general_broadcast(self, event: dict):
         event.pop('type')
         await self.send_json(event)
 

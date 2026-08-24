@@ -5,12 +5,6 @@ from asgiref.sync import async_to_sync
 from channels.db import database_sync_to_async
 from django.contrib.auth import get_user_model
 
-from rest_framework_channels.exceptions import (
-    debug_exception_handlers,
-    production_exception_handlers,
-)
-from rest_framework_channels.handlers import AsyncActionHandler
-
 
 @database_sync_to_async
 def create_user():
@@ -23,10 +17,11 @@ def user():
 
 
 @pytest.fixture
-def debug_exception_handler():
-    # I couldn't override the settings by `from django.test import override_settings`
-    # Workaround is here
-    AsyncActionHandler.exception_handler = debug_exception_handlers
+def debug_exception_handler(settings):
+    # The handler is resolved per exception, so overriding the setting is enough.
+    settings.REST_FRAMEWORK_CHANNELS = {
+        'EXCEPTION_HANDLER': (
+            'rest_framework_channels.exceptions.debug_exception_handlers'
+        )
+    }
     yield
-    # revert
-    AsyncActionHandler.exception_handler = production_exception_handlers
